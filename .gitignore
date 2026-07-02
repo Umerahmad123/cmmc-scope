@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+
+# Evidence output (contains sensitive audit data)
+cmmc_evidence/
+
+# Junk folders
+mnt/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# AWS credentials
+.aws/
+.env
+.env*
