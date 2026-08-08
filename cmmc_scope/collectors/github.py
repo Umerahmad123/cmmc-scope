@@ -104,9 +104,9 @@ def _extract_protection_details(
         dismiss_stale_reviews=dismiss_stale,
         require_code_owner_reviews=require_code_owners,
         require_status_checks=require_status_checks,
-        enforce_admins=protection.enforce_admins.enabled,
-        allow_force_pushes=protection.allow_force_pushes.enabled,
-        allow_deletions=protection.allow_deletions.enabled,
+        enforce_admins=getattr(protection.enforce_admins, "enabled", protection.enforce_admins) if not isinstance(protection.enforce_admins, bool) else protection.enforce_admins,
+        allow_force_pushes=getattr(protection.allow_force_pushes, "enabled", protection.allow_force_pushes) if not isinstance(protection.allow_force_pushes, bool) else protection.allow_force_pushes,
+        allow_deletions=getattr(protection.allow_deletions, "enabled", protection.allow_deletions) if not isinstance(protection.allow_deletions, bool) else protection.allow_deletions,
     )
 
 
