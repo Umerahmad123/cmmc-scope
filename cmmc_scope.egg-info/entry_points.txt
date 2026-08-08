@@ -1,0 +1,2 @@
+[console_scripts]
+cmmc-scope = cmmc_scope.main:main

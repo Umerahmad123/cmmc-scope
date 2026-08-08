@@ -37,7 +37,6 @@ class IamUserMfaRecord:
     arn: str
     password_enabled: bool
     mfa_active: bool
-    # Console access is only meaningful for users with a password set.
     has_console_access: bool
 
     @property
@@ -66,16 +65,16 @@ _REPORT_POLL_INTERVAL_SECONDS = 2
 
 
 def _str_to_bool(value: str) -> bool:
-    """Convert a CSV boolean string ('true'/'false') to a Python bool."""
+    """Convert a CSV boolean string to a Python bool."""
     return value in _BOOL_TRUE_VALUES
 
 
 def _wait_for_credential_report(iam_client: Any) -> None:
     """
     Trigger credential-report generation and block until AWS reports it
-    is complete.  Raises RuntimeError if the report never becomes ready.
+    is complete. Raises RuntimeError if the report never becomes ready.
     """
-    logger.debug("Requesting IAM credential report generation…")
+    logger.debug("Requesting IAM credential report generation...")
     deadline = time.monotonic() + _MAX_REPORT_WAIT_SECONDS
 
     while time.monotonic() < deadline:
@@ -105,8 +104,6 @@ def _parse_credential_report_csv(raw_csv: str) -> list[IamUserMfaRecord]:
     for row in reader:
         username: str = row.get("user", "")
 
-        # The root account row is represented as '<root_account>' — skip it
-        # because root MFA is evaluated differently (not via IAM users).
         if username == "<root_account>":
             logger.debug("Skipping root account row in credential report.")
             continue
@@ -139,21 +136,6 @@ def collect_iam_mfa_status(
 ) -> CredentialReportResult:
     """
     Collect IAM MFA status for all users in the target AWS account.
-
-    Uses the IAM Credential Report, which is the authoritative AWS source
-    for password and MFA status across all IAM users.
-
-    Args:
-        profile_name: Optional AWS CLI named profile.  When None, boto3 falls
-                      back to its standard credential chain (env vars, instance
-                      profile, ~/.aws/credentials, etc.).
-        region_name:  AWS region used to create the boto3 session.  The IAM
-                      service is global, but a region is required for the
-                      session itself.
-
-    Returns:
-        A CredentialReportResult containing the parsed user records and any
-        non-fatal errors encountered during collection.
     """
     result = CredentialReportResult(account_id="unknown", report_generated_at="unknown")
 
@@ -162,17 +144,21 @@ def collect_iam_mfa_status(
         iam_client = session.client("iam")
         sts_client = session.client("sts")
 
-        # Resolve the numeric AWS account ID for the evidence report.
         caller_identity = sts_client.get_caller_identity()
         result.account_id = caller_identity.get("Account", "unknown")
         logger.info("Targeting AWS account: %s", result.account_id)
 
-        # Generate and wait for the credential report.
         _wait_for_credential_report(iam_client)
 
-        # Retrieve the report content.
         report_response = iam_client.get_credential_report()
-        raw_csv: str = report_response["Content"].read().decode("utf-8")
+
+        # boto3 returns Content as bytes directly — no .read() needed
+        content = report_response["Content"]
+        if hasattr(content, "read"):
+            raw_csv: str = content.read().decode("utf-8")
+        else:
+            raw_csv = content.decode("utf-8")
+
         result.report_generated_at = str(
             report_response.get("GeneratedTime", "unknown")
         )
@@ -191,7 +177,7 @@ def collect_iam_mfa_status(
         logger.error(msg)
         result.collection_errors.append(msg)
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         msg = f"Unexpected error during AWS collection: {exc}"
         logger.exception(msg)
         result.collection_errors.append(msg)
