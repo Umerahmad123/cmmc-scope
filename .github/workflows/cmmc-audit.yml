@@ -1,0 +1,48 @@
+name: CMMC Level 2 Compliance Audit
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Every Monday at 06:00 UTC
+  push:
+    branches: [master]
+  workflow_dispatch:       # Manual trigger from Actions tab
+
+jobs:
+  cmmc-audit:
+    name: Run CMMC-Scope
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install CMMC-Scope
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run CMMC audit
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CMMC_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CMMC_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+          GITHUB_TOKEN: ${{ secrets.CMMC_GITHUB_TOKEN }}
+        run: |
+          cmmc-scope audit all \
+            --repo Umerahmad123/cmmc-scope \
+            --output-dir ./cmmc_evidence \
+            --format both
+
+      - name: Upload evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmmc-evidence-${{ github.run_id }}
+          path: ./cmmc_evidence/
+          retention-days: 2555
