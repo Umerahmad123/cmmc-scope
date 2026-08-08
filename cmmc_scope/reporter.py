@@ -21,18 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def _safe(text: str) -> str:
-    """Replace unicode characters that latin-1 cannot encode."""
-    return (
-        text
-        .replace("\u2014", "-")
-        .replace("\u2013", "-")
-        .replace("\u2026", "...")
-        .replace("\u2018", "'")
-        .replace("\u2019", "'")
-        .replace("\u201c", '"')
-        .replace("\u201d", '"')
-        .replace("\u2014", "-")
-    )
+    """Strip any character that latin-1 cannot encode."""
+    return text.encode("latin-1", errors="replace").decode("latin-1")
 
 
 # ---------------------------------------------------------------------------
