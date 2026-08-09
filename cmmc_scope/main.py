@@ -16,12 +16,13 @@ from rich.table import Table
 from rich import box
 
 from cmmc_scope import __version__
-from cmmc_scope.collectors.aws import collect_iam_mfa_status
+from cmmc_scope.collectors.aws import collect_iam_mfa_status, collect_cloudtrail_status
 from cmmc_scope.collectors.github import collect_branch_protection
 from cmmc_scope.engine import (
     ComplianceStatus,
     Finding,
     evaluate_branch_protection,
+    evaluate_cloudtrail,
     evaluate_iam_mfa,
     evaluate_stale_accounts,
 )
@@ -170,23 +171,27 @@ def cmd_audit_aws(
     fmt: str = _FORMAT_OPTION,
     verbose: bool = _VERBOSE_OPTION,
 ) -> None:
-    """Run all AWS checks: IA.L2-3.5.3 (MFA) and AC.L2-3.1.1 (Stale Accounts)."""
+    """Run all AWS checks: IA.L2-3.5.3, AC.L2-3.1.1, AU.L2-3.3.1."""
     _set_verbosity(verbose)
 
     console.print(
         Panel(
             "[bold]CMMC-Scope[/bold] - Audit - AWS\n"
-            "[cyan]Controls:[/cyan] IA.L2-3.5.3 (MFA) + AC.L2-3.1.1 (Stale Accounts)",
+            "[cyan]Controls:[/cyan] IA.L2-3.5.3 (MFA) + AC.L2-3.1.1 (Stale Accounts) + AU.L2-3.3.1 (CloudTrail)",
             expand=False,
         )
     )
 
-    with console.status("[bold green]Collecting IAM credential report from AWS..."):
-        raw = collect_iam_mfa_status(profile_name=profile, region_name=region)
+    with console.status("[bold green]Collecting IAM credential report..."):
+        iam_raw = collect_iam_mfa_status(profile_name=profile, region_name=region)
+
+    with console.status("[bold green]Collecting CloudTrail status..."):
+        ct_raw = collect_cloudtrail_status(profile_name=profile, region_name=region)
 
     findings = [
-        evaluate_iam_mfa(raw),
-        evaluate_stale_accounts(raw),
+        evaluate_iam_mfa(iam_raw),
+        evaluate_stale_accounts(iam_raw),
+        evaluate_cloudtrail(ct_raw),
     ]
 
     _print_findings_table(findings)
@@ -206,7 +211,7 @@ def cmd_audit_github(
     fmt: str = _FORMAT_OPTION,
     verbose: bool = _VERBOSE_OPTION,
 ) -> None:
-    """Run CM.L2-3.4.1 (Branch Protection) check on a GitHub repository."""
+    """Run CM.L2-3.4.1 (Branch Protection) check."""
     _set_verbosity(verbose)
 
     resolved_token = token or os.environ.get("GITHUB_TOKEN", "")
@@ -223,7 +228,7 @@ def cmd_audit_github(
         )
     )
 
-    with console.status("[bold green]Collecting branch protection data from GitHub..."):
+    with console.status("[bold green]Collecting branch protection data..."):
         raw = collect_branch_protection(
             github_token=resolved_token,
             repo_full_name=repo,
@@ -261,28 +266,32 @@ def cmd_audit_all(
     console.print(
         Panel(
             "[bold]CMMC-Scope[/bold] - Audit - All Controls\n"
-            "Running: IA.L2-3.5.3 (MFA) + AC.L2-3.1.1 (Stale Accounts) + CM.L2-3.4.1 (Branch Protection)",
+            "Running: IA.L2-3.5.3 + AC.L2-3.1.1 + AU.L2-3.3.1 + CM.L2-3.4.1",
             expand=False,
         )
     )
 
     findings: list[Finding] = []
 
-    with console.status("[bold green][1/2] Collecting IAM credential report..."):
-        aws_raw = collect_iam_mfa_status(
+    with console.status("[bold green][1/3] Collecting IAM credential report..."):
+        iam_raw = collect_iam_mfa_status(
             profile_name=aws_profile, region_name=aws_region
         )
+    findings.append(evaluate_iam_mfa(iam_raw))
+    findings.append(evaluate_stale_accounts(iam_raw))
 
-    findings.append(evaluate_iam_mfa(aws_raw))
-    findings.append(evaluate_stale_accounts(aws_raw))
+    with console.status("[bold green][2/3] Collecting CloudTrail status..."):
+        ct_raw = collect_cloudtrail_status(
+            profile_name=aws_profile, region_name=aws_region
+        )
+    findings.append(evaluate_cloudtrail(ct_raw))
 
-    with console.status("[bold green][2/2] Collecting GitHub branch protection data..."):
+    with console.status("[bold green][3/3] Collecting GitHub branch protection data..."):
         gh_raw = collect_branch_protection(
             github_token=resolved_token,
             repo_full_name=repo,
             branch_name=branch,
         )
-
     findings.append(evaluate_branch_protection(gh_raw))
 
     _print_findings_table(findings)

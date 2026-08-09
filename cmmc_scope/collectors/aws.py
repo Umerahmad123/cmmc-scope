@@ -8,7 +8,8 @@ returns it as plain Python structures. All compliance logic lives in engine.py.
 CMMC Controls targeted:
   - IA.L2-3.5.3 (Multi-Factor Authentication)
   - AC.L2-3.1.1 (Account Access Control / Stale Accounts)
-NIST SP 800-171 References: 3.5.3, 3.1.1
+  - AU.L2-3.3.1 (Audit Logging / CloudTrail)
+NIST SP 800-171 References: 3.5.3, 3.1.1, 3.3.1
 """
 
 from __future__ import annotations
@@ -34,28 +35,26 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class IamUserMfaRecord:
-    """Immutable record describing a single IAM user's MFA status."""
+    """Immutable record describing a single IAM user's MFA and login status."""
 
     username: str
     arn: str
     password_enabled: bool
     mfa_active: bool
     has_console_access: bool
-    password_last_used: str   # Raw string from CSV e.g. "2024-01-15T10:30:00+00:00" or "N/A"
-    days_since_login: int     # -1 means never logged in or N/A
+    password_last_used: str
+    days_since_login: int
 
     @property
     def is_at_risk(self) -> bool:
-        """True when the user can log in via the console but has no MFA."""
         return self.has_console_access and not self.mfa_active
 
     @property
     def is_stale(self) -> bool:
-        """True when user has console access but hasn't logged in for 90+ days."""
         if not self.has_console_access:
             return False
         if self.days_since_login == -1:
-            return True   # Never logged in = stale
+            return True
         return self.days_since_login >= 90
 
 
@@ -69,8 +68,30 @@ class CredentialReportResult:
     collection_errors: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class CloudTrailRecord:
+    """Immutable record describing a single CloudTrail trail."""
+
+    name: str
+    home_region: str
+    is_multi_region: bool
+    is_logging: bool
+    has_log_validation: bool
+    s3_bucket: str
+
+
+@dataclass
+class CloudTrailResult:
+    """Container for the CloudTrail collection run."""
+
+    account_id: str
+    region_checked: str
+    trails: list[CloudTrailRecord] = field(default_factory=list)
+    collection_errors: list[str] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal helpers — IAM
 # ---------------------------------------------------------------------------
 
 _BOOL_TRUE_VALUES = {"true", "TRUE", "True"}
@@ -80,15 +101,10 @@ _STALE_THRESHOLD_DAYS = 90
 
 
 def _str_to_bool(value: str) -> bool:
-    """Convert a CSV boolean string to a Python bool."""
     return value in _BOOL_TRUE_VALUES
 
 
 def _days_since(date_str: str) -> int:
-    """
-    Calculate how many days ago a date string was.
-    Returns -1 if the date is N/A, no_information, or cannot be parsed.
-    """
     if not date_str or date_str in ("N/A", "no_information", "not_supported"):
         return -1
     try:
@@ -100,10 +116,6 @@ def _days_since(date_str: str) -> int:
 
 
 def _wait_for_credential_report(iam_client: Any) -> None:
-    """
-    Trigger credential-report generation and block until AWS reports it
-    is complete. Raises RuntimeError if the report never becomes ready.
-    """
     logger.debug("Requesting IAM credential report generation...")
     deadline = time.monotonic() + _MAX_REPORT_WAIT_SECONDS
 
@@ -111,10 +123,8 @@ def _wait_for_credential_report(iam_client: Any) -> None:
         response = iam_client.generate_credential_report()
         state = response.get("State", "")
         logger.debug("Credential report state: %s", state)
-
         if state == "COMPLETE":
             return
-
         time.sleep(_REPORT_POLL_INTERVAL_SECONDS)
 
     raise RuntimeError(
@@ -124,18 +134,12 @@ def _wait_for_credential_report(iam_client: Any) -> None:
 
 
 def _parse_credential_report_csv(raw_csv: str) -> list[IamUserMfaRecord]:
-    """
-    Parse the raw CSV content of an IAM credential report into a list of
-    IamUserMfaRecord objects, skipping the root account row.
-    """
     records: list[IamUserMfaRecord] = []
     reader = csv.DictReader(io.StringIO(raw_csv))
 
     for row in reader:
         username: str = row.get("user", "")
-
         if username == "<root_account>":
-            logger.debug("Skipping root account row in credential report.")
             continue
 
         password_enabled = _str_to_bool(row.get("password_enabled", "false"))
@@ -155,12 +159,12 @@ def _parse_credential_report_csv(raw_csv: str) -> list[IamUserMfaRecord]:
             )
         )
 
-    logger.debug("Parsed %d IAM user records from credential report.", len(records))
+    logger.debug("Parsed %d IAM user records.", len(records))
     return records
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — IAM
 # ---------------------------------------------------------------------------
 
 
@@ -169,10 +173,13 @@ def collect_iam_mfa_status(
     region_name: str = "us-east-1",
 ) -> CredentialReportResult:
     """
-    Collect IAM MFA status and last-login data for all users in the target
-    AWS account. Used by both IA.L2-3.5.3 and AC.L2-3.1.1 evaluations.
+    Collect IAM MFA status and last-login data for all users.
+    Used by both IA.L2-3.5.3 and AC.L2-3.1.1 evaluations.
     """
-    result = CredentialReportResult(account_id="unknown", report_generated_at="unknown")
+    result = CredentialReportResult(
+        account_id="unknown",
+        report_generated_at="unknown",
+    )
 
     try:
         session = boto3.Session(profile_name=profile_name, region_name=region_name)
@@ -186,23 +193,19 @@ def collect_iam_mfa_status(
         _wait_for_credential_report(iam_client)
 
         report_response = iam_client.get_credential_report()
-
         content = report_response["Content"]
-        if hasattr(content, "read"):
-            raw_csv: str = content.read().decode("utf-8")
-        else:
-            raw_csv = content.decode("utf-8")
-
+        raw_csv: str = (
+            content.read().decode("utf-8")
+            if hasattr(content, "read")
+            else content.decode("utf-8")
+        )
         result.report_generated_at = str(
             report_response.get("GeneratedTime", "unknown")
         )
-
         result.users = _parse_credential_report_csv(raw_csv)
 
     except ClientError as exc:
-        error_code = exc.response["Error"]["Code"]
-        error_msg = exc.response["Error"]["Message"]
-        msg = f"AWS ClientError [{error_code}]: {error_msg}"
+        msg = f"AWS ClientError [{exc.response['Error']['Code']}]: {exc.response['Error']['Message']}"
         logger.error(msg)
         result.collection_errors.append(msg)
 
@@ -213,6 +216,82 @@ def collect_iam_mfa_status(
 
     except Exception as exc:
         msg = f"Unexpected error during AWS collection: {exc}"
+        logger.exception(msg)
+        result.collection_errors.append(msg)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public API — CloudTrail
+# ---------------------------------------------------------------------------
+
+
+def collect_cloudtrail_status(
+    profile_name: str | None = None,
+    region_name: str = "us-east-1",
+) -> CloudTrailResult:
+    """
+    Collect CloudTrail trail configuration for the target AWS account.
+
+    Checks whether CloudTrail is enabled, multi-region, actively logging,
+    and has log file validation turned on.
+
+    Used by AU.L2-3.3.1 evaluation.
+    """
+    result = CloudTrailResult(account_id="unknown", region_checked=region_name)
+
+    try:
+        session = boto3.Session(profile_name=profile_name, region_name=region_name)
+        ct_client = session.client("cloudtrail")
+        sts_client = session.client("sts")
+
+        caller_identity = sts_client.get_caller_identity()
+        result.account_id = caller_identity.get("Account", "unknown")
+        logger.info("Collecting CloudTrail status for account: %s", result.account_id)
+
+        # describe_trails returns all trails visible from this region.
+        # includeShadowTrails=False returns only trails with home region = this region.
+        # We use True to see all trails including multi-region ones homed elsewhere.
+        trails_response = ct_client.describe_trails(includeShadowTrails=False)
+        trail_list = trails_response.get("trailList", [])
+
+        logger.debug("Found %d CloudTrail trail(s).", len(trail_list))
+
+        for trail in trail_list:
+            trail_name = trail.get("Name", "unknown")
+            trail_arn = trail.get("TrailARN", "")
+
+            # Get live logging status for this trail
+            try:
+                status_response = ct_client.get_trail_status(Name=trail_arn)
+                is_logging = status_response.get("IsLogging", False)
+            except ClientError:
+                is_logging = False
+
+            result.trails.append(
+                CloudTrailRecord(
+                    name=trail_name,
+                    home_region=trail.get("HomeRegion", region_name),
+                    is_multi_region=trail.get("IsMultiRegionTrail", False),
+                    is_logging=is_logging,
+                    has_log_validation=trail.get("LogFileValidationEnabled", False),
+                    s3_bucket=trail.get("S3BucketName", "unknown"),
+                )
+            )
+
+    except ClientError as exc:
+        msg = f"AWS ClientError [{exc.response['Error']['Code']}]: {exc.response['Error']['Message']}"
+        logger.error(msg)
+        result.collection_errors.append(msg)
+
+    except BotoCoreError as exc:
+        msg = f"BotoCoreError during CloudTrail collection: {exc}"
+        logger.error(msg)
+        result.collection_errors.append(msg)
+
+    except Exception as exc:
+        msg = f"Unexpected error during CloudTrail collection: {exc}"
         logger.exception(msg)
         result.collection_errors.append(msg)
 
