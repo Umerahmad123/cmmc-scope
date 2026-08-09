@@ -1,14 +1,12 @@
 """
 Evaluation Engine — cmmc_scope/engine.py
 
-This module is the compliance brain of CMMC-Scope.  It accepts raw data
-from the collector modules and applies deterministic pass/fail logic to
-produce structured Finding objects that are mapped to official CMMC / NIST
-SP 800-171 control identifiers.
+Applies deterministic pass/fail logic to produce structured Finding objects
+mapped to official CMMC / NIST SP 800-171 control identifiers.
 
 Design invariants:
-  - No I/O occurs here (no boto3, no GitHub calls, no file writes).
-  - All functions are pure: same inputs → same outputs.
+  - No I/O occurs here.
+  - All functions are pure: same inputs, same outputs.
   - Every Finding carries enough context for an auditor to reproduce the check.
 """
 
@@ -32,46 +30,26 @@ logger = logging.getLogger(__name__)
 
 
 class ComplianceStatus(str, Enum):
-    """Tri-state compliance result aligned with CMMC assessment terminology."""
-
-    PASS = "PASS"          # Control objective is met.
-    FAIL = "FAIL"          # Control objective is NOT met.
-    ERROR = "ERROR"        # Collection or evaluation could not complete.
-    NOT_APPLICABLE = "N/A" # Control is not applicable to the scoped environment.
+    PASS = "PASS"
+    FAIL = "FAIL"
+    ERROR = "ERROR"
+    NOT_APPLICABLE = "N/A"
 
 
 @dataclass
 class Finding:
-    """
-    A single, atomic compliance finding tied to one CMMC control.
-
-    This is the primary data structure emitted by the engine and consumed by
-    reporter.py.  All fields are intentionally primitive-typed so the object
-    is trivially JSON-serialisable.
-    """
-
-    # ── CMMC / NIST identifiers ──────────────────────────────────────────────
-    cmmc_practice_id: str       # e.g. "IA.L2-3.5.3"
-    nist_control_id: str        # e.g. "3.5.3"
-    control_family: str         # e.g. "Identification & Authentication"
-    control_title: str          # Short human-readable title
-
-    # ── Evaluation result ────────────────────────────────────────────────────
+    cmmc_practice_id: str
+    nist_control_id: str
+    control_family: str
+    control_title: str
     status: ComplianceStatus
-    summary: str                # One-sentence plain-English verdict
-
-    # ── Evidence detail ──────────────────────────────────────────────────────
-    # Each string in `evidence` is one discrete, auditor-visible data point.
+    summary: str
     evidence: list[str] = field(default_factory=list)
-
-    # Items the auditor must remediate to achieve compliance.
     remediation_items: list[str] = field(default_factory=list)
-
-    # ── Provenance ───────────────────────────────────────────────────────────
     evaluated_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    resource_scope: str = ""    # e.g. "AWS Account 123456789012"
+    resource_scope: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -92,16 +70,22 @@ _CM_L2_3_4_1 = dict(
     control_title="Baseline Configuration & Change Control",
 )
 
+_AC_L2_3_1_1 = dict(
+    cmmc_practice_id="AC.L2-3.1.1",
+    nist_control_id="3.1.1",
+    control_family="Access Control (AC)",
+    control_title="Authorized Access Control / Stale Account Detection",
+)
+
 
 # ---------------------------------------------------------------------------
-# IA.L2-3.5.3 — MFA Evaluation
+# IA.L2-3.5.3 - MFA Evaluation
 # ---------------------------------------------------------------------------
 
 
 def _classify_mfa_users(
     users: Sequence[IamUserMfaRecord],
 ) -> tuple[list[IamUserMfaRecord], list[IamUserMfaRecord]]:
-    """Partition users into compliant and non-compliant buckets."""
     compliant = [u for u in users if not u.is_at_risk]
     non_compliant = [u for u in users if u.is_at_risk]
     return compliant, non_compliant
@@ -110,35 +94,19 @@ def _classify_mfa_users(
 def evaluate_iam_mfa(result: CredentialReportResult) -> Finding:
     """
     Evaluate IA.L2-3.5.3: require MFA for every IAM user that has console
-    access (i.e. a password is enabled).
-
-    A user is considered "at risk" when:
-      - password_enabled is True  (they can authenticate to the AWS Console)
-      - mfa_active is False       (they have no MFA device registered)
-
-    Args:
-        result: The output of collectors.aws.collect_iam_mfa_status().
-
-    Returns:
-        A Finding with PASS, FAIL, or ERROR status.
+    access.
     """
     resource_scope = f"AWS Account {result.account_id}"
     base_kwargs = {**_IA_L2_3_5_3, "resource_scope": resource_scope}
 
-    # ── Collection error short-circuit ──────────────────────────────────────
     if result.collection_errors:
-        error_detail = "; ".join(result.collection_errors)
-        logger.error("MFA evaluation aborted due to collection errors: %s", error_detail)
         return Finding(
             **base_kwargs,
             status=ComplianceStatus.ERROR,
-            summary=(
-                "Evaluation could not complete due to AWS API collection errors."
-            ),
+            summary="Evaluation could not complete due to AWS API collection errors.",
             evidence=[f"Collection error: {e}" for e in result.collection_errors],
         )
 
-    # ── No users found ───────────────────────────────────────────────────────
     if not result.users:
         return Finding(
             **base_kwargs,
@@ -149,7 +117,6 @@ def evaluate_iam_mfa(result: CredentialReportResult) -> Finding:
 
     compliant_users, non_compliant_users = _classify_mfa_users(result.users)
 
-    # Build evidence list — every user's status is logged for the auditor.
     evidence: list[str] = [
         f"Credential report generated at: {result.report_generated_at}",
         f"Total IAM users evaluated (excluding root): {len(result.users)}",
@@ -158,20 +125,19 @@ def evaluate_iam_mfa(result: CredentialReportResult) -> Finding:
     ]
 
     for user in compliant_users:
-        evidence.append(f"  [PASS] {user.username} — MFA active: {user.mfa_active}")
+        evidence.append(f"  [PASS] {user.username} - MFA active: {user.mfa_active}")
 
     for user in non_compliant_users:
         evidence.append(
             f"  [FAIL] {user.username} (ARN: {user.arn}) "
-            f"— MFA active: {user.mfa_active}, "
+            f"- MFA active: {user.mfa_active}, "
             f"Console access: {user.has_console_access}"
         )
 
     if non_compliant_users:
         remediation = [
             f"Enable MFA for IAM user '{u.username}' "
-            f"(navigate to IAM → Users → {u.username} → Security credentials → "
-            f"Assign MFA device)."
+            f"(IAM > Users > {u.username} > Security credentials > Assign MFA device)."
             for u in non_compliant_users
         ]
         return Finding(
@@ -179,7 +145,7 @@ def evaluate_iam_mfa(result: CredentialReportResult) -> Finding:
             status=ComplianceStatus.FAIL,
             summary=(
                 f"{len(non_compliant_users)} of {len(result.users)} IAM user(s) "
-                f"have console access without MFA — CMMC IA.L2-3.5.3 is NOT satisfied."
+                f"have console access without MFA - CMMC IA.L2-3.5.3 is NOT satisfied."
             ),
             evidence=evidence,
             remediation_items=remediation,
@@ -190,48 +156,122 @@ def evaluate_iam_mfa(result: CredentialReportResult) -> Finding:
         status=ComplianceStatus.PASS,
         summary=(
             f"All {len(compliant_users)} IAM user(s) with console access "
-            f"have MFA enabled — CMMC IA.L2-3.5.3 is satisfied."
+            f"have MFA enabled - CMMC IA.L2-3.5.3 is satisfied."
         ),
         evidence=evidence,
     )
 
 
 # ---------------------------------------------------------------------------
-# CM.L2-3.4.1 — Branch Protection Evaluation
+# AC.L2-3.1.1 - Stale Account Evaluation
+# ---------------------------------------------------------------------------
+
+
+def evaluate_stale_accounts(result: CredentialReportResult) -> Finding:
+    """
+    Evaluate AC.L2-3.1.1: detect IAM users with console access who have not
+    logged in for 90 or more days, or have never logged in.
+
+    Stale accounts that remain active violate the principle of least privilege
+    and are a common finding in CMMC assessments.
+    """
+    resource_scope = f"AWS Account {result.account_id}"
+    base_kwargs = {**_AC_L2_3_1_1, "resource_scope": resource_scope}
+
+    if result.collection_errors:
+        return Finding(
+            **base_kwargs,
+            status=ComplianceStatus.ERROR,
+            summary="Evaluation could not complete due to AWS API collection errors.",
+            evidence=[f"Collection error: {e}" for e in result.collection_errors],
+        )
+
+    # Only evaluate users who have console access
+    console_users = [u for u in result.users if u.has_console_access]
+
+    if not console_users:
+        return Finding(
+            **base_kwargs,
+            status=ComplianceStatus.PASS,
+            summary="No IAM users with console access found; control is satisfied.",
+            evidence=["IAM credential report returned zero console users (excluding root)."],
+        )
+
+    stale_users = [u for u in console_users if u.is_stale]
+    active_users = [u for u in console_users if not u.is_stale]
+
+    evidence: list[str] = [
+        f"Credential report generated at: {result.report_generated_at}",
+        f"Total IAM console users evaluated: {len(console_users)}",
+        f"Active users (logged in within 90 days): {len(active_users)}",
+        f"Stale users (90+ days or never logged in): {len(stale_users)}",
+        f"Stale account threshold: 90 days",
+    ]
+
+    for user in active_users:
+        days = user.days_since_login
+        days_str = f"{days} days ago" if days >= 0 else "never"
+        evidence.append(
+            f"  [PASS] {user.username} - Last login: {user.password_last_used} ({days_str})"
+        )
+
+    for user in stale_users:
+        days = user.days_since_login
+        days_str = f"{days} days ago" if days >= 0 else "NEVER"
+        evidence.append(
+            f"  [FAIL] {user.username} (ARN: {user.arn}) "
+            f"- Last login: {user.password_last_used} ({days_str})"
+        )
+
+    if stale_users:
+        remediation = [
+            f"Disable or delete stale IAM user '{u.username}' "
+            f"(last login: {u.password_last_used}). "
+            f"If the account is still needed, ensure the user logs in to confirm "
+            f"active use, then document the business justification."
+            for u in stale_users
+        ]
+        return Finding(
+            **base_kwargs,
+            status=ComplianceStatus.FAIL,
+            summary=(
+                f"{len(stale_users)} of {len(console_users)} IAM console user(s) "
+                f"have not logged in for 90+ days or have never logged in - "
+                f"CMMC AC.L2-3.1.1 is NOT satisfied."
+            ),
+            evidence=evidence,
+            remediation_items=remediation,
+        )
+
+    return Finding(
+        **base_kwargs,
+        status=ComplianceStatus.PASS,
+        summary=(
+            f"All {len(active_users)} IAM console user(s) have logged in within "
+            f"the last 90 days - CMMC AC.L2-3.1.1 is satisfied."
+        ),
+        evidence=evidence,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CM.L2-3.4.1 - Branch Protection Evaluation
 # ---------------------------------------------------------------------------
 
 
 def evaluate_branch_protection(result: BranchProtectionResult) -> Finding:
     """
     Evaluate CM.L2-3.4.1: verify that the repository's primary branch
-    enforces pull-request reviews before code can be merged, establishing a
-    baseline configuration change-control mechanism.
-
-    A repository is considered compliant when:
-      - Branch protection is enabled on the default/target branch.
-      - At least one approving review is required before merge.
-
-    Args:
-        result: The output of collectors.github.collect_branch_protection().
-
-    Returns:
-        A Finding with PASS, FAIL, or ERROR status.
+    enforces pull-request reviews before code can be merged.
     """
     resource_scope = f"GitHub Repository: {result.repo_full_name}"
     base_kwargs = {**_CM_L2_3_4_1, "resource_scope": resource_scope}
 
-    # ── Collection error short-circuit ──────────────────────────────────────
     if result.collection_errors:
-        error_detail = "; ".join(result.collection_errors)
-        logger.error(
-            "Branch-protection evaluation aborted: %s", error_detail
-        )
         return Finding(
             **base_kwargs,
             status=ComplianceStatus.ERROR,
-            summary=(
-                "Evaluation could not complete due to GitHub API collection errors."
-            ),
+            summary="Evaluation could not complete due to GitHub API collection errors.",
             evidence=[f"Collection error: {e}" for e in result.collection_errors],
         )
 
@@ -244,7 +284,6 @@ def evaluate_branch_protection(result: BranchProtectionResult) -> Finding:
             evidence=["BranchProtectionResult.details was None despite no errors."],
         )
 
-    # Build a comprehensive evidence trail.
     evidence: list[str] = [
         f"Repository: {details.repo_full_name}",
         f"Branch inspected: {details.branch_name}",
@@ -260,35 +299,32 @@ def evaluate_branch_protection(result: BranchProtectionResult) -> Finding:
         f"Branch deletions allowed: {details.allow_deletions}",
     ]
 
-    # ── Primary compliance gate: protection must be on ───────────────────────
     if not details.protection_enabled:
         return Finding(
             **base_kwargs,
             status=ComplianceStatus.FAIL,
             summary=(
-                f"Branch '{details.branch_name}' has NO protection rules — "
+                f"Branch '{details.branch_name}' has NO protection rules - "
                 f"direct pushes and force-pushes are unrestricted. "
                 f"CMMC CM.L2-3.4.1 is NOT satisfied."
             ),
             evidence=evidence,
             remediation_items=[
                 f"Enable Branch Protection on '{details.branch_name}' in "
-                f"'{details.repo_full_name}': Settings → Branches → "
+                f"'{details.repo_full_name}': Settings > Branches > "
                 f"Add branch protection rule.",
                 "Require at least 1 approving pull request review before merging.",
                 "Enable 'Dismiss stale pull request approvals when new commits are pushed'.",
-                "Consider enabling 'Require review from Code Owners'.",
             ],
         )
 
-    # ── Secondary gate: PR reviews must be required ──────────────────────────
     if not details.required_pr_reviews:
         return Finding(
             **base_kwargs,
             status=ComplianceStatus.FAIL,
             summary=(
                 f"Branch '{details.branch_name}' has protection enabled but does NOT "
-                f"require pull-request reviews — direct merges are unrestricted. "
+                f"require pull-request reviews - direct merges are unrestricted. "
                 f"CMMC CM.L2-3.4.1 is NOT satisfied."
             ),
             evidence=evidence,
@@ -300,13 +336,13 @@ def evaluate_branch_protection(result: BranchProtectionResult) -> Finding:
             ],
         )
 
-    # ── PASS ─────────────────────────────────────────────────────────────────
     return Finding(
         **base_kwargs,
         status=ComplianceStatus.PASS,
         summary=(
-            f"Branch '{details.branch_name}' requires {details.required_approving_review_count} "
-            f"approving PR review(s) before merge — CMMC CM.L2-3.4.1 is satisfied."
+            f"Branch '{details.branch_name}' requires "
+            f"{details.required_approving_review_count} approving PR review(s) "
+            f"before merge - CMMC CM.L2-3.4.1 is satisfied."
         ),
         evidence=evidence,
     )

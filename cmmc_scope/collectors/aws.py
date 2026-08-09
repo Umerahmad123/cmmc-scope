@@ -5,8 +5,10 @@ Responsible for all interactions with the AWS API via boto3.
 This module is intentionally side-effect-free: it fetches data and
 returns it as plain Python structures. All compliance logic lives in engine.py.
 
-CMMC Control targeted: IA.L2-3.5.3 (Multi-Factor Authentication)
-NIST SP 800-171 Reference: 3.5.3
+CMMC Controls targeted:
+  - IA.L2-3.5.3 (Multi-Factor Authentication)
+  - AC.L2-3.1.1 (Account Access Control / Stale Accounts)
+NIST SP 800-171 References: 3.5.3, 3.1.1
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import io
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import boto3
@@ -38,11 +41,22 @@ class IamUserMfaRecord:
     password_enabled: bool
     mfa_active: bool
     has_console_access: bool
+    password_last_used: str   # Raw string from CSV e.g. "2024-01-15T10:30:00+00:00" or "N/A"
+    days_since_login: int     # -1 means never logged in or N/A
 
     @property
     def is_at_risk(self) -> bool:
         """True when the user can log in via the console but has no MFA."""
         return self.has_console_access and not self.mfa_active
+
+    @property
+    def is_stale(self) -> bool:
+        """True when user has console access but hasn't logged in for 90+ days."""
+        if not self.has_console_access:
+            return False
+        if self.days_since_login == -1:
+            return True   # Never logged in = stale
+        return self.days_since_login >= 90
 
 
 @dataclass
@@ -62,11 +76,27 @@ class CredentialReportResult:
 _BOOL_TRUE_VALUES = {"true", "TRUE", "True"}
 _MAX_REPORT_WAIT_SECONDS = 60
 _REPORT_POLL_INTERVAL_SECONDS = 2
+_STALE_THRESHOLD_DAYS = 90
 
 
 def _str_to_bool(value: str) -> bool:
     """Convert a CSV boolean string to a Python bool."""
     return value in _BOOL_TRUE_VALUES
+
+
+def _days_since(date_str: str) -> int:
+    """
+    Calculate how many days ago a date string was.
+    Returns -1 if the date is N/A, no_information, or cannot be parsed.
+    """
+    if not date_str or date_str in ("N/A", "no_information", "not_supported"):
+        return -1
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return (now - dt).days
+    except (ValueError, TypeError):
+        return -1
 
 
 def _wait_for_credential_report(iam_client: Any) -> None:
@@ -110,6 +140,8 @@ def _parse_credential_report_csv(raw_csv: str) -> list[IamUserMfaRecord]:
 
         password_enabled = _str_to_bool(row.get("password_enabled", "false"))
         mfa_active = _str_to_bool(row.get("mfa_active", "false"))
+        password_last_used = row.get("password_last_used", "N/A")
+        days_since_login = _days_since(password_last_used)
 
         records.append(
             IamUserMfaRecord(
@@ -118,6 +150,8 @@ def _parse_credential_report_csv(raw_csv: str) -> list[IamUserMfaRecord]:
                 password_enabled=password_enabled,
                 mfa_active=mfa_active,
                 has_console_access=password_enabled,
+                password_last_used=password_last_used,
+                days_since_login=days_since_login,
             )
         )
 
@@ -135,7 +169,8 @@ def collect_iam_mfa_status(
     region_name: str = "us-east-1",
 ) -> CredentialReportResult:
     """
-    Collect IAM MFA status for all users in the target AWS account.
+    Collect IAM MFA status and last-login data for all users in the target
+    AWS account. Used by both IA.L2-3.5.3 and AC.L2-3.1.1 evaluations.
     """
     result = CredentialReportResult(account_id="unknown", report_generated_at="unknown")
 
@@ -152,7 +187,6 @@ def collect_iam_mfa_status(
 
         report_response = iam_client.get_credential_report()
 
-        # boto3 returns Content as bytes directly — no .read() needed
         content = report_response["Content"]
         if hasattr(content, "read"):
             raw_csv: str = content.read().decode("utf-8")
